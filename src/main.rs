@@ -19,6 +19,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
+// Bring winit accessor traits and raw events into scope for Drag-and-Drop
+use slint::winit_030::{WinitWindowAccessor, winit};
+
 static AUTO_SAVE_LOGS: AtomicBool = AtomicBool::new(false);
 
 #[derive(Parser, Debug)]
@@ -435,6 +438,20 @@ fn main() -> Result<(), slint::PlatformError> {
     // Initialize OS Context Menu and Log configuration states on startup
     ui.set_is_integrated(check_registry_integration());
     ui.set_auto_save_logs(AUTO_SAVE_LOGS.load(Ordering::Relaxed));
+
+    // DRAG-AND-DROP INTEGRATION:
+    // Intercepts window events at the OS level. If a user drops a folder from
+    // Windows Explorer, we automatically set the target directory in the UI. [1]
+    let ui_weak_dnd = ui_handle.clone();
+    ui.window().on_winit_window_event(move |_, event| {
+        // Collapsed nested if let bindings using Rust let-chains:
+        if let winit::event::WindowEvent::DroppedFile(path_buf) = event
+            && let Some(ui) = ui_weak_dnd.upgrade()
+        {
+            ui.set_selected_folder(SharedString::from(path_buf.to_string_lossy().into_owned()));
+        }
+        slint::winit_030::EventResult::Propagate
+    });
 
     if let Some(path) = cli.path {
         ui.set_selected_folder(SharedString::from(path));
