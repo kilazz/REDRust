@@ -3,6 +3,8 @@ use rayon::prelude::*;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use wildmatch::WildMatch;
 
 #[derive(Clone, Debug)]
@@ -31,6 +33,7 @@ pub fn scan_empty_dirs<F: Fn(&str)>(
     root: &Path,
     settings: &ScanSettings,
     _log: &F,
+    cancel_flag: &Arc<AtomicBool>, // Changed from AtomicUsize to AtomicBool
 ) -> Result<Vec<DirectoryNode>, String> {
     let file_matchers: Vec<WildMatch> = settings
         .ignore_files
@@ -54,9 +57,15 @@ pub fn scan_empty_dirs<F: Fn(&str)>(
         .git_global(false);
 
     let (tx, rx) = std::sync::mpsc::channel();
+    let cancel_walk = cancel_flag.clone();
     builder.build_parallel().run(|| {
         let tx = tx.clone();
+        let cancel_inner = cancel_walk.clone();
         Box::new(move |result| {
+            // Abort parallel walk immediately if cancellation was requested
+            if cancel_inner.load(Ordering::Relaxed) {
+                return ignore::WalkState::Quit;
+            }
             if let Ok(entry) = result {
                 let _ = tx.send(entry);
             }
@@ -66,6 +75,11 @@ pub fn scan_empty_dirs<F: Fn(&str)>(
     drop(tx);
 
     let entries: Vec<ignore::DirEntry> = rx.into_iter().collect();
+
+    // Abort early before doing heavy metadata computation
+    if cancel_flag.load(Ordering::Relaxed) {
+        return Err("Operation cancelled by user".to_string());
+    }
 
     // Parallel metadata gathering
     let mut entry_states: Vec<_> = entries
@@ -117,6 +131,11 @@ pub fn scan_empty_dirs<F: Fn(&str)>(
     let mut empty_dirs_found: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
     for (p, depth, is_dir, is_file, child_name, is_young_dir, is_empty_file) in entry_states {
+        // Stop sweep reduction immediately if cancellation is requested
+        if cancel_flag.load(Ordering::Relaxed) {
+            return Err("Operation cancelled by user".to_string());
+        }
+
         if settings.max_depth >= 0 && (depth as i32) > settings.max_depth {
             if let Some(parent) = p.parent() {
                 dir_status.insert(parent.to_path_buf(), false);
@@ -279,6 +298,7 @@ pub fn delete_empty_dirs<F, P>(
     settings: &DeleteSettings,
     log: &F,
     progress_cb: &P,
+    cancel_flag: &Arc<AtomicBool>, // Changed from AtomicUsize to AtomicBool
 ) -> (usize, usize)
 where
     F: Fn(&str, usize, i32),
@@ -305,14 +325,22 @@ where
         .collect();
 
     for (_depth, indices) in depths.into_iter().rev() {
+        if cancel_flag.load(Ordering::Relaxed) {
+            break;
+        }
+
         if settings.pause_ms == 0 {
             // Fast parallel path
             let results: Vec<_> = {
                 // Borrow immutably in a restricted scope to satisfy Sync bounds
                 let nodes_ref: &[DirectoryNode] = nodes;
+                let cancel_inner = cancel_flag.clone();
                 indices
                     .par_iter()
                     .map(|&i| {
+                        if cancel_inner.load(Ordering::Relaxed) {
+                            return (i, 4, "Cancelled".to_string(), None);
+                        }
                         let dir = &nodes_ref[i].path;
 
                         match clean_and_verify_empty(dir, settings, &file_matchers) {
@@ -323,7 +351,6 @@ where
                                 let res = if settings.move_to_trash && !is_symlink {
                                     trash::delete(dir).map_err(|e| e.to_string())
                                 } else {
-                                    // If it's a symlink, aggressively use fs::remove_dir/file to avoid trashing its real contents
                                     if is_symlink {
                                         fs::remove_dir(dir)
                                             .or_else(|_| fs::remove_file(dir))
@@ -365,6 +392,14 @@ where
 
             let mut abort = false;
             for (i, status, msg, _err) in results {
+                if cancel_flag.load(Ordering::Relaxed) {
+                    abort = true;
+                    break;
+                }
+                if msg == "Cancelled" {
+                    continue;
+                }
+
                 processed_items += 1;
                 progress_cb(processed_items as f32 / total_items as f32);
 
@@ -389,7 +424,12 @@ where
             // Slow sequential path with pause
             let mut abort = false;
             for &i in &indices {
-                let dir = nodes[i].path.clone(); // Clone path to detach lifetime from 'nodes'
+                if cancel_flag.load(Ordering::Relaxed) {
+                    abort = true;
+                    break;
+                }
+
+                let dir = nodes[i].path.clone();
 
                 match clean_and_verify_empty(&dir, settings, &file_matchers) {
                     Ok(true) => {

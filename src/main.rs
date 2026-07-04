@@ -7,6 +7,7 @@ use slint::{ModelRc, SharedString, VecModel};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
@@ -147,6 +148,7 @@ fn main() -> Result<(), slint::PlatformError> {
 
     // Full console mode (CLI) without launching the graphical user interface
     if cli.quiet || cli.delete {
+        let dummy_cancel = Arc::new(AtomicBool::new(false));
         if let Some(path_str) = cli.path {
             let path = PathBuf::from(path_str);
             let scan_settings = scanner::ScanSettings {
@@ -172,11 +174,16 @@ fn main() -> Result<(), slint::PlatformError> {
             if !cli.quiet {
                 println!("[*] Scanning: {:?}", path);
             }
-            match scanner::scan_empty_dirs(&path, &scan_settings, &|msg| {
-                if !cli.quiet {
-                    println!("{}", msg);
-                }
-            }) {
+            match scanner::scan_empty_dirs(
+                &path,
+                &scan_settings,
+                &|msg| {
+                    if !cli.quiet {
+                        println!("{}", msg);
+                    }
+                },
+                &dummy_cancel,
+            ) {
                 Ok(mut dirs) => {
                     let empty_count = dirs.iter().filter(|d| d.status == 1).count();
                     if !cli.quiet {
@@ -201,7 +208,8 @@ fn main() -> Result<(), slint::PlatformError> {
                                     println!("{}", msg);
                                 }
                             },
-                            &|_| {}, // Omit progress updates in pure console mode
+                            &|_| {},
+                            &dummy_cancel,
                         );
                         if !cli.quiet {
                             println!("[+] Finished. Deleted: {}, Failed: {}", deleted, failed);
@@ -233,12 +241,14 @@ fn main() -> Result<(), slint::PlatformError> {
     };
 
     let found_folders = Arc::new(Mutex::new(Vec::<scanner::DirectoryNode>::new()));
+    let cancel_flag = Arc::new(AtomicBool::new(false)); // Shared cancellation token [1]
+
     ui.set_directories(ModelRc::from(Rc::new(VecModel::from(vec![]))));
 
     let ui_weak_log = ui_handle.clone();
     let found_folders_log = found_folders.clone();
 
-    // Background thread to manage logs and UI state updates
+    // Background thread to manage logs, progress metrics, and UI state updates
     thread::spawn(move || {
         let mut logs = VecDeque::with_capacity(300);
         while let Ok(evt) = log_rx.recv() {
@@ -305,9 +315,12 @@ fn main() -> Result<(), slint::PlatformError> {
     });
 
     let ui_weak_cancel = ui_handle.clone();
+    let cancel_flag_cancel = cancel_flag.clone();
     ui.on_cancel_operation(move || {
+        // Toggle the global cancellation token and notify UI immediately [2]
+        cancel_flag_cancel.store(true, Ordering::Relaxed);
         if let Some(ui) = ui_weak_cancel.upgrade() {
-            ui.set_status_msg("Cancellation requested (not fully implemented).".into());
+            ui.set_status_msg("Cancellation requested...".into());
         }
     });
 
@@ -328,10 +341,12 @@ fn main() -> Result<(), slint::PlatformError> {
     let ui_weak_scan = ui_handle.clone();
     let logger_scan = logger.clone();
     let found_folders_scan = found_folders.clone();
+    let cancel_flag_scan = cancel_flag.clone();
     ui.on_search_folders(move || {
         let ui_weak = ui_weak_scan.clone();
         let logger = logger_scan.clone();
         let folders_state = found_folders_scan.clone();
+        let cancel_flag_thread = cancel_flag_scan.clone();
 
         let ui = ui_weak.upgrade().unwrap();
         let folder_path = ui.get_selected_folder().to_string();
@@ -345,7 +360,7 @@ fn main() -> Result<(), slint::PlatformError> {
 
         ui.set_is_scanning(true);
         ui.set_status_msg("Scanning...".into());
-        ui.set_progress(0.0); // Will become "indeterminate/looping" in Slint due to is_scanning
+        ui.set_progress(0.0);
 
         if folder_path.is_empty() {
             logger.log("Please select a folder first.");
@@ -373,6 +388,8 @@ fn main() -> Result<(), slint::PlatformError> {
             consider_empty_files_empty,
         };
 
+        cancel_flag_thread.store(false, Ordering::Relaxed); // Reset token before operation [3]
+
         let ui_weak_thread = ui.as_weak();
         thread::spawn(move || {
             logger.log(&format!(
@@ -380,7 +397,12 @@ fn main() -> Result<(), slint::PlatformError> {
                 path
             ));
 
-            match scanner::scan_empty_dirs(&path, &settings, &|msg| logger.log(msg)) {
+            match scanner::scan_empty_dirs(
+                &path,
+                &settings,
+                &|msg| logger.log(msg),
+                &cancel_flag_thread,
+            ) {
                 Ok(empty_dirs) => {
                     let count = empty_dirs.len();
                     let empty_count = empty_dirs.iter().filter(|d| d.status == 1).count();
@@ -407,14 +429,19 @@ fn main() -> Result<(), slint::PlatformError> {
                             "Found {} empty directories.",
                             empty_count
                         )));
-                        ui.set_progress(1.0); // Max out progress indicator upon completion
+                        ui.set_progress(1.0);
                     });
                 }
                 Err(e) => {
-                    logger.log(&format!("[!] Error scanning: {}", e));
-                    let _ = ui_weak_thread.upgrade_in_event_loop(|ui| {
+                    logger.log(&format!("[!] {}", e));
+                    let status = if e.contains("cancelled") {
+                        "Scan cancelled."
+                    } else {
+                        "Scan failed."
+                    };
+                    let _ = ui_weak_thread.upgrade_in_event_loop(move |ui| {
                         ui.set_is_scanning(false);
-                        ui.set_status_msg("Scan failed.".into());
+                        ui.set_status_msg(status.into());
                     });
                 }
             }
@@ -424,10 +451,12 @@ fn main() -> Result<(), slint::PlatformError> {
     let ui_weak_del = ui_handle.clone();
     let logger_del = logger.clone();
     let found_folders_del = found_folders.clone();
+    let cancel_flag_del = cancel_flag.clone();
     ui.on_delete_folders(move || {
         let ui_weak = ui_weak_del.clone();
         let logger = logger_del.clone();
         let folders_state = found_folders_del.clone();
+        let cancel_flag_thread = cancel_flag_del.clone();
 
         let ui = ui_weak.upgrade().unwrap();
         let move_to_trash = ui.get_delete_mode() == 0;
@@ -438,9 +467,11 @@ fn main() -> Result<(), slint::PlatformError> {
 
         ui.set_is_deleting(true);
         ui.set_status_msg("Deleting...".into());
-        ui.set_progress(0.0); // Reset progress for deletion phase
+        ui.set_progress(0.0);
 
         let ui_weak_thread = ui.as_weak();
+        cancel_flag_thread.store(false, Ordering::Relaxed); // Reset token before operation [3]
+
         thread::spawn(move || {
             let mut dirs = {
                 let state = folders_state.lock().unwrap();
@@ -472,9 +503,11 @@ fn main() -> Result<(), slint::PlatformError> {
                 &mut dirs,
                 &settings,
                 &|msg, idx, stat| logger.status(msg, idx, stat),
-                &|p| logger.progress(p), // Forward live progress float
+                &|p| logger.progress(p),
+                &cancel_flag_thread, // Forward cancellation token reference
             );
 
+            let was_cancelled = cancel_flag_thread.load(Ordering::Relaxed);
             logger.log(&format!(
                 "[+] Deletion finished. Deleted: {}, Failed: {}",
                 deleted, failed
@@ -486,8 +519,12 @@ fn main() -> Result<(), slint::PlatformError> {
                 ui.set_deleted_count(deleted as i32);
                 ui.set_failed_count(failed as i32);
                 ui.set_is_deleting(false);
-                ui.set_status_msg("Deletion complete.".into());
-                ui.set_progress(1.0); // Force 100% just in case
+                if was_cancelled {
+                    ui.set_status_msg("Deletion cancelled.".into());
+                } else {
+                    ui.set_status_msg("Deletion complete.".into());
+                }
+                ui.set_progress(1.0);
             });
         });
     });
