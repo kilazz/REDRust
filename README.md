@@ -1,4 +1,4 @@
-# RED (Rust Empty Directory)
+# RED (Remove Empty Directory)
 RED is a fast, parallelized GUI tool written in Rust for finding and cleaning up empty directories on your filesystem. Built with [Slint](https://slint.dev/) for a lightweight, native user interface and [Rayon](https://github.com/rayon-rs/rayon) for high-performance parallel scanning.
 
 ## Features
