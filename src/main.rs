@@ -105,9 +105,10 @@ impl UiLogger {
 fn rebuild_visible_items(folders: &[scanner::DirectoryNode]) -> Vec<DirectoryItem> {
     let mut result = Vec::new();
     let mut hide_depth = i32::MAX;
+
     // Grows on demand instead of the old fixed `[false; 256]` buffer, which
     // silently mis-rendered the tree lines for anything nested deeper than
-    // 256 levels (e.g. some node_modules-style trees).
+    // 256 levels (e.g., some node_modules-style trees).
     let mut active_depths: Vec<bool> = Vec::new();
 
     for (i, node) in folders.iter().enumerate() {
@@ -163,6 +164,16 @@ fn rebuild_visible_items(folders: &[scanner::DirectoryNode]) -> Vec<DirectoryIte
 }
 
 fn main() -> Result<(), slint::PlatformError> {
+    // Attempt to attach to the parent terminal console (PowerShell/CMD) if the app
+    // was launched via CLI. This allows a GUI app to print stdout/stderr.
+    #[cfg(target_os = "windows")]
+    unsafe {
+        use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
+        // Result is ignored: if launched via double-click from Explorer, it fails silently
+        // and the app just runs as a normal GUI.
+        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+
     let cli = Cli::parse();
 
     // Full console mode (CLI) without launching the graphical user interface
@@ -323,7 +334,8 @@ fn main() -> Result<(), slint::PlatformError> {
 
             let is_finished = progress_update.map(|p| p >= 1.0).unwrap_or(false);
 
-            // Rebuild tree if status changed AND either 120ms passed, or we finished, or total size is small (< 150 items)
+            // Rebuild tree if status changed AND either 120ms passed, or we finished,
+            // or total size is small (< 150 items)
             let should_rebuild = pending_status_updates
                 && (elapsed_ms >= 120 || folders_clone.len() < 150 || is_finished);
 
