@@ -59,6 +59,11 @@ struct Cli {
 
     #[arg(long, default_value_t = true)]
     consider_empty_files_empty: bool,
+
+    /// Collapse access-denied style errors into a single summary line instead
+    /// of printing each one.
+    #[arg(long, default_value_t = true)]
+    hide_search_errors: bool,
 }
 
 pub enum LogEvent {
@@ -100,19 +105,27 @@ impl UiLogger {
 fn rebuild_visible_items(folders: &[scanner::DirectoryNode]) -> Vec<DirectoryItem> {
     let mut result = Vec::new();
     let mut hide_depth = i32::MAX;
-    let mut active_depths = vec![false; 256];
+    // Grows on demand instead of the old fixed `[false; 256]` buffer, which
+    // silently mis-rendered the tree lines for anything nested deeper than
+    // 256 levels (e.g. some node_modules-style trees).
+    let mut active_depths: Vec<bool> = Vec::new();
 
     for (i, node) in folders.iter().enumerate() {
         if node.depth <= hide_depth {
             hide_depth = i32::MAX;
 
-            if node.depth > 0 && node.depth < 256 {
-                active_depths[(node.depth - 1) as usize] = !node.is_last_sibling;
+            if node.depth > 0 {
+                let idx = (node.depth - 1) as usize;
+                if active_depths.len() <= idx {
+                    active_depths.resize(idx + 1, false);
+                }
+                active_depths[idx] = !node.is_last_sibling;
             }
 
             let mut tree_lines_vec = Vec::new();
             for d in 0..(node.depth - 1) {
-                if d < 256 && active_depths[d as usize] {
+                let d = d as usize;
+                if d < active_depths.len() && active_depths[d] {
                     tree_lines_vec.push(1); // vertical
                 } else {
                     tree_lines_vec.push(0); // empty
@@ -175,6 +188,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 min_age_hours: cli.min_age_hours,
                 max_depth: cli.max_depth,
                 consider_empty_files_empty: cli.consider_empty_files_empty,
+                hide_search_errors: cli.hide_search_errors,
             };
 
             if !cli.quiet {
@@ -372,7 +386,10 @@ fn main() -> Result<(), slint::PlatformError> {
         let folders_state = found_folders_scan.clone();
         let cancel_flag_thread = cancel_flag_scan.clone();
 
-        let ui = ui_weak.upgrade().unwrap();
+        let ui = match ui_weak.upgrade() {
+            Some(ui) => ui,
+            None => return,
+        };
         let folder_path = ui.get_selected_folder().to_string();
         let ignore_files = ui.get_ignore_files_text().to_string();
         let ignore_dirs = ui.get_ignore_list_text().to_string();
@@ -381,6 +398,7 @@ fn main() -> Result<(), slint::PlatformError> {
         let min_age_hours = ui.get_min_age_hours();
         let max_depth = ui.get_max_depth();
         let consider_empty_files_empty = ui.get_consider_empty_files_empty();
+        let hide_search_errors = ui.get_hide_search_errors();
 
         ui.set_is_scanning(true);
         ui.set_status_msg("Scanning...".into());
@@ -410,6 +428,7 @@ fn main() -> Result<(), slint::PlatformError> {
             min_age_hours: min_age_hours as u32,
             max_depth,
             consider_empty_files_empty,
+            hide_search_errors,
         };
 
         cancel_flag_thread.store(false, Ordering::Relaxed);
@@ -482,7 +501,10 @@ fn main() -> Result<(), slint::PlatformError> {
         let folders_state = found_folders_del.clone();
         let cancel_flag_thread = cancel_flag_del.clone();
 
-        let ui = ui_weak.upgrade().unwrap();
+        let ui = match ui_weak.upgrade() {
+            Some(ui) => ui,
+            None => return,
+        };
         let move_to_trash = ui.get_delete_mode() == 0;
         let ignore_errors = ui.get_ignore_errors();
         let pause_ms = ui.get_pause_ms();

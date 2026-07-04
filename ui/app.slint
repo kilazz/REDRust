@@ -263,7 +263,9 @@ export component AppWindow inherits Window {
 
     // Settings
     in-out property <bool> consider_empty_files_empty: true;
-    in-out property <bool> ignore_hidden: false;
+    // Default aligned with the CLI's --ignore-hidden default (true) so GUI and
+    // CLI behave the same out of the box.
+    in-out property <bool> ignore_hidden: true;
     in-out property <bool> ignore_errors: true;
     in-out property <bool> hide_search_errors: true;
     in-out property <int> delete_mode: 0; // 0 = Trash, 1 = Permanent

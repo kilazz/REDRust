@@ -1,5 +1,6 @@
 use ignore::WalkBuilder;
 use rayon::prelude::*;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -16,6 +17,9 @@ pub struct ScanSettings {
     pub min_age_hours: u32,
     pub max_depth: i32,
     pub consider_empty_files_empty: bool,
+    /// If true, access-error details (e.g. "access denied") are collapsed into
+    /// a single summary line instead of being logged individually.
+    pub hide_search_errors: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -29,10 +33,50 @@ pub struct DirectoryNode {
     pub is_last_sibling: bool,
 }
 
+/// Messages coming out of the parallel filesystem walk: either a successfully
+/// read entry, or an error (e.g. permission denied) that we still want to
+/// surface to the user instead of silently dropping.
+enum WalkMsg {
+    Entry(ignore::DirEntry),
+    Error(String),
+}
+
+/// Walks up from `start` toward `root`, adding every ancestor to `included`
+/// so it appears in the tree view. Stops as soon as an ancestor is already
+/// present (it and everything above it was already added).
+fn add_ancestors(included: &mut FxHashSet<PathBuf>, start: &Path, root: &Path) {
+    let mut parent = start.parent();
+    while let Some(par) = parent {
+        if !included.insert(par.to_path_buf()) {
+            break;
+        }
+        if par == root {
+            break;
+        }
+        parent = par.parent();
+    }
+}
+
+/// Checks the Windows "system" file attribute. On non-Windows platforms there
+/// is no equivalent concept, so this always returns false there.
+#[cfg(windows)]
+fn is_system_dir(path: &Path) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_SYSTEM: u32 = 0x4;
+    fs::metadata(path)
+        .map(|m| m.file_attributes() & FILE_ATTRIBUTE_SYSTEM != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(windows))]
+fn is_system_dir(_path: &Path) -> bool {
+    false
+}
+
 pub fn scan_empty_dirs<F: Fn(&str)>(
     root: &Path,
     settings: &ScanSettings,
-    _log: &F,
+    log: &F,
     cancel_flag: &Arc<AtomicBool>,
 ) -> Result<Vec<DirectoryNode>, String> {
     let file_matchers: Vec<WildMatch> = settings
@@ -56,7 +100,7 @@ pub fn scan_empty_dirs<F: Fn(&str)>(
         .git_exclude(false)
         .git_global(false);
 
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = std::sync::mpsc::channel::<WalkMsg>();
     let cancel_walk = cancel_flag.clone();
     builder.build_parallel().run(|| {
         let tx = tx.clone();
@@ -66,19 +110,44 @@ pub fn scan_empty_dirs<F: Fn(&str)>(
             if cancel_inner.load(Ordering::Relaxed) {
                 return ignore::WalkState::Quit;
             }
-            if let Ok(entry) = result {
-                let _ = tx.send(entry);
+            match result {
+                Ok(entry) => {
+                    let _ = tx.send(WalkMsg::Entry(entry));
+                }
+                Err(err) => {
+                    let _ = tx.send(WalkMsg::Error(err.to_string()));
+                }
             }
             ignore::WalkState::Continue
         })
     });
     drop(tx);
 
-    let entries: Vec<ignore::DirEntry> = rx.into_iter().collect();
+    let mut entries: Vec<ignore::DirEntry> = Vec::new();
+    let mut walk_errors: Vec<String> = Vec::new();
+    for msg in rx {
+        match msg {
+            WalkMsg::Entry(e) => entries.push(e),
+            WalkMsg::Error(e) => walk_errors.push(e),
+        }
+    }
 
     // Abort early before doing heavy metadata computation
     if cancel_flag.load(Ordering::Relaxed) {
         return Err("Operation cancelled by user".to_string());
+    }
+
+    if !walk_errors.is_empty() {
+        if settings.hide_search_errors {
+            log(&format!(
+                "[!] {} item(s) skipped due to access errors (enable \"Hide search errors\" off to see details).",
+                walk_errors.len()
+            ));
+        } else {
+            for e in &walk_errors {
+                log(&format!("[!] Access error: {}", e));
+            }
+        }
     }
 
     // Parallel metadata gathering
@@ -126,9 +195,12 @@ pub fn scan_empty_dirs<F: Fn(&str)>(
     // Sort bottom-up for correct analysis of cascading emptiness
     entry_states.sort_by_key(|(_, d, _, _, _, _, _)| std::cmp::Reverse(*d));
 
-    let mut dir_status: std::collections::HashMap<PathBuf, bool> = std::collections::HashMap::new();
-    let mut included_dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-    let mut empty_dirs_found: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    // FxHashMap/FxHashSet: faster non-cryptographic hashing for PathBuf keys
+    // than the default SipHash-based std collections, meaningful on large trees.
+    let mut dir_status: FxHashMap<PathBuf, bool> = FxHashMap::default();
+    let mut included_dirs: FxHashSet<PathBuf> = FxHashSet::default();
+    let mut empty_dirs_found: FxHashSet<PathBuf> = FxHashSet::default();
+    let mut protected_dirs: FxHashSet<PathBuf> = FxHashSet::default();
 
     for (p, depth, is_dir, is_file, child_name, is_young_dir, is_empty_file) in entry_states {
         // Stop sweep reduction immediately if cancellation is requested
@@ -145,46 +217,70 @@ pub fn scan_empty_dirs<F: Fn(&str)>(
 
         if is_dir {
             let dir_name = &child_name;
-            let full_path_lower = p.to_string_lossy().replace('\\', "/").to_lowercase();
-
             let mut is_empty = *dir_status.get(&p).unwrap_or(&true);
+            let mut is_protected = false;
 
-            if is_empty
-                && (dir_matchers.iter().any(|m| full_path_lower.contains(m))
-                    || ((settings.ignore_hidden || settings.keep_system)
-                        && dir_name.starts_with('.'))
-                    || is_young_dir)
-            {
-                is_empty = false;
+            if is_empty {
+                // Skip building the lowercase path string entirely when there is
+                // nothing to match against (common case: empty ignore list).
+                let matches_ignore_dir = if dir_matchers.is_empty() {
+                    false
+                } else {
+                    let full_path_lower = p.to_string_lossy().replace('\\', "/").to_lowercase();
+                    dir_matchers.iter().any(|m| full_path_lower.contains(m))
+                };
+                // These used to be combined with OR into a single condition, which
+                // meant "keep_system" (default: on) silently protected every
+                // dot-directory regardless of the "ignore_hidden" checkbox state.
+                // They are now independent checks.
+                let matches_hidden = settings.ignore_hidden && dir_name.starts_with('.');
+                let matches_system = settings.keep_system && is_system_dir(&p);
+
+                if matches_ignore_dir || matches_hidden || matches_system || is_young_dir {
+                    is_empty = false;
+                    is_protected = true;
+                }
             }
 
             dir_status.insert(p.clone(), is_empty);
 
-            if is_empty && p != root {
-                empty_dirs_found.insert(p.clone());
-                included_dirs.insert(p.clone());
-
-                let mut parent = p.parent();
-                while let Some(par) = parent {
-                    if !included_dirs.insert(par.to_path_buf()) {
-                        break;
+            if p != root {
+                if is_empty {
+                    empty_dirs_found.insert(p.clone());
+                    included_dirs.insert(p.clone());
+                    add_ancestors(&mut included_dirs, &p, root);
+                } else {
+                    if let Some(parent) = p.parent() {
+                        dir_status.insert(parent.to_path_buf(), false);
                     }
-                    if par == root {
-                        break;
+                    // A directory that would otherwise be empty, but is protected
+                    // (ignore list / hidden / system / too young), is now surfaced
+                    // in the tree with status 3 instead of silently vanishing.
+                    if is_protected {
+                        protected_dirs.insert(p.clone());
+                        included_dirs.insert(p.clone());
+                        add_ancestors(&mut included_dirs, &p, root);
                     }
-                    parent = par.parent();
                 }
-            } else if !is_empty
-                && p != root
-                && let Some(parent) = p.parent()
-            {
-                dir_status.insert(parent.to_path_buf(), false);
             }
         } else if is_file
             && !is_empty_file
             && !file_matchers.iter().any(|m| m.matches(&child_name))
             && let Some(parent) = p.parent()
         {
+            dir_status.insert(parent.to_path_buf(), false);
+        } else if !is_dir
+            && !is_file
+            && !file_matchers.iter().any(|m| m.matches(&child_name))
+            && let Some(parent) = p.parent()
+        {
+            // Symlinks (and any other special entry type) fall through both
+            // is_dir and is_file when the walker doesn't follow links. They used
+            // to be silently ignored here, which made a directory containing only
+            // a symlink look "empty" during scanning even though deletion later
+            // refuses to remove it (clean_and_verify_empty keeps unignored
+            // symlinks in place). Treating them as real content keeps scan-time
+            // and delete-time behavior consistent.
             dir_status.insert(parent.to_path_buf(), false);
         }
     }
@@ -195,6 +291,7 @@ pub fn scan_empty_dirs<F: Fn(&str)>(
     let mut result = Vec::new();
     for p in sorted_paths {
         let is_empty = empty_dirs_found.contains(&p);
+        let is_protected = protected_dirs.contains(&p);
         let depth = (p.components().count() as i32) - root_depth;
         let name = if p == root {
             p.to_string_lossy().into_owned()
@@ -208,7 +305,13 @@ pub fn scan_empty_dirs<F: Fn(&str)>(
             path: p,
             name,
             depth,
-            status: if is_empty { 1 } else { 0 },
+            status: if is_empty {
+                1
+            } else if is_protected {
+                3
+            } else {
+                0
+            },
             has_children: false,
             is_expanded: true,
             is_last_sibling: false,
