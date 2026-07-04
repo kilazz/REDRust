@@ -3,7 +3,7 @@ slint::include_modules!();
 mod scanner;
 
 use clap::Parser;
-use slint::{Model, ModelRc, SharedString, VecModel};
+use slint::{ModelRc, SharedString, VecModel};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -13,17 +13,51 @@ use std::thread;
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
+    /// The target directory path to scan.
     #[arg(index = 1)]
     path: Option<String>,
+
+    /// Run without launching the graphical user interface.
     #[arg(short, long)]
     quiet: bool,
+
+    /// Automatically delete empty directories found during the scan.
     #[arg(short, long)]
     delete: bool,
+
+    // Configurable parameters for scripts and automation
+    #[arg(long, default_value_t = -1)]
+    max_depth: i32,
+
+    #[arg(long)]
+    delete_permanently: bool,
+
+    #[arg(long, default_value = "desktop.ini,Thumbs.db,.DS_Store")]
+    ignore_files: String,
+
+    #[arg(
+        long,
+        default_value = "System Volume Information,RECYCLER,Recycled,$RECYCLE.BIN"
+    )]
+    ignore_dirs: String,
+
+    #[arg(long, default_value_t = true)]
+    ignore_hidden: bool,
+
+    #[arg(long, default_value_t = true)]
+    keep_system: bool,
+
+    #[arg(long, default_value_t = 0)]
+    min_age_hours: u32,
+
+    #[arg(long, default_value_t = true)]
+    consider_empty_files_empty: bool,
 }
 
 pub enum LogEvent {
     Msg(String),
     StatusChange(usize, i32), // index, status
+    Progress(f32),            // Event for updating the progress bar
 }
 
 #[derive(Clone)]
@@ -46,6 +80,12 @@ impl UiLogger {
             let _ = sender.send(LogEvent::StatusChange(index, status));
         } else {
             println!("{}", msg);
+        }
+    }
+
+    pub fn progress(&self, val: f32) {
+        if let Some(sender) = &self.sender {
+            let _ = sender.send(LogEvent::Progress(val));
         }
     }
 }
@@ -90,7 +130,7 @@ fn rebuild_visible_items(folders: &[scanner::DirectoryNode]) -> Vec<DirectoryIte
                 is_expanded: node.is_expanded,
                 id: i as i32,
                 is_root: node.depth == 0,
-                tree_prefix: SharedString::new(), // kept for compatibility if needed, or remove
+                tree_prefix: SharedString::new(),
                 tree_lines: tree_lines_model.into(),
             });
 
@@ -105,8 +145,78 @@ fn rebuild_visible_items(folders: &[scanner::DirectoryNode]) -> Vec<DirectoryIte
 fn main() -> Result<(), slint::PlatformError> {
     let cli = Cli::parse();
 
-    if cli.quiet {
-        // Implement quiet mode if needed later
+    // Full console mode (CLI) without launching the graphical user interface
+    if cli.quiet || cli.delete {
+        if let Some(path_str) = cli.path {
+            let path = PathBuf::from(path_str);
+            let scan_settings = scanner::ScanSettings {
+                ignore_files: cli
+                    .ignore_files
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect(),
+                ignore_dirs: cli
+                    .ignore_dirs
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect(),
+                ignore_hidden: cli.ignore_hidden,
+                keep_system: cli.keep_system,
+                min_age_hours: cli.min_age_hours,
+                max_depth: cli.max_depth,
+                consider_empty_files_empty: cli.consider_empty_files_empty,
+            };
+
+            if !cli.quiet {
+                println!("[*] Scanning: {:?}", path);
+            }
+            match scanner::scan_empty_dirs(&path, &scan_settings, &|msg| {
+                if !cli.quiet {
+                    println!("{}", msg);
+                }
+            }) {
+                Ok(mut dirs) => {
+                    let empty_count = dirs.iter().filter(|d| d.status == 1).count();
+                    if !cli.quiet {
+                        println!("[+] Found {} empty directories.", empty_count);
+                    }
+                    if cli.delete && empty_count > 0 {
+                        if !cli.quiet {
+                            println!("[*] Deleting...");
+                        }
+                        let delete_settings = scanner::DeleteSettings {
+                            move_to_trash: !cli.delete_permanently,
+                            ignore_errors: true,
+                            pause_ms: 0,
+                            ignore_files: scan_settings.ignore_files.clone(),
+                            consider_empty_files_empty: cli.consider_empty_files_empty,
+                        };
+                        let (deleted, failed) = scanner::delete_empty_dirs(
+                            &mut dirs,
+                            &delete_settings,
+                            &|msg, _, _| {
+                                if !cli.quiet {
+                                    println!("{}", msg);
+                                }
+                            },
+                            &|_| {}, // Omit progress updates in pure console mode
+                        );
+                        if !cli.quiet {
+                            println!("[+] Finished. Deleted: {}, Failed: {}", deleted, failed);
+                        }
+                    }
+                }
+                Err(e) => {
+                    if !cli.quiet {
+                        eprintln!("[!] Error: {}", e);
+                    }
+                }
+            }
+        } else {
+            eprintln!("[!] Error: Path is required for CLI/Quiet mode.");
+        }
         return Ok(());
     }
 
@@ -122,63 +232,63 @@ fn main() -> Result<(), slint::PlatformError> {
         sender: Some(log_tx),
     };
 
-    // Shared state for directories so delete thread can access them
     let found_folders = Arc::new(Mutex::new(Vec::<scanner::DirectoryNode>::new()));
     ui.set_directories(ModelRc::from(Rc::new(VecModel::from(vec![]))));
 
     let ui_weak_log = ui_handle.clone();
     let found_folders_log = found_folders.clone();
+
+    // Background thread to manage logs and UI state updates
     thread::spawn(move || {
         let mut logs = VecDeque::with_capacity(300);
         while let Ok(evt) = log_rx.recv() {
             let mut status_updates = Vec::new();
-            match evt {
-                LogEvent::Msg(msg) => {
-                    logs.push_back(msg);
-                }
-                LogEvent::StatusChange(index, status) => {
-                    status_updates.push((index, status));
-                }
-            }
+            let mut progress_update = None;
+
+            let mut process_event = |e: LogEvent| match e {
+                LogEvent::Msg(msg) => logs.push_back(msg),
+                LogEvent::StatusChange(index, status) => status_updates.push((index, status)),
+                LogEvent::Progress(p) => progress_update = Some(p),
+            };
+
+            process_event(evt);
+
+            // Drain remaining events in the channel queue
             while let Ok(m) = log_rx.try_recv() {
-                match m {
-                    LogEvent::Msg(msg) => logs.push_back(msg),
-                    LogEvent::StatusChange(index, status) => {
-                        status_updates.push((index, status));
-                    }
-                }
+                process_event(m);
             }
+
             while logs.len() > 250 {
                 logs.pop_front();
             }
 
-            // Update the source of truth
-            {
+            let folders_clone = {
                 let mut folders = found_folders_log.lock().unwrap();
                 for &(index, status) in &status_updates {
                     if let Some(node) = folders.get_mut(index) {
                         node.status = status;
                     }
                 }
-            }
+                folders.clone()
+            };
 
             let combined = logs.iter().cloned().collect::<String>();
             let _ = ui_weak_log.upgrade_in_event_loop(move |ui| {
                 ui.set_log_text(combined.into());
-                let model = ui.get_directories();
-                for (index, status) in status_updates {
-                    for i in 0..model.row_count() {
-                        if let Some(mut item) = model.row_data(i)
-                            && item.id as usize == index
-                        {
-                            item.status = status;
-                            model.set_row_data(i, item);
-                            break;
-                        }
-                    }
+
+                // Update progress smoothly if an event was received
+                if let Some(p) = progress_update {
+                    ui.set_progress(p);
+                }
+
+                // Only rebuild the heavy list if statuses actually changed
+                if !status_updates.is_empty() {
+                    let list_items = rebuild_visible_items(&folders_clone);
+                    let new_model = Rc::new(VecModel::from(list_items));
+                    ui.set_directories(new_model.into());
                 }
             });
-            thread::sleep(std::time::Duration::from_millis(16));
+            thread::sleep(std::time::Duration::from_millis(16)); // ~60fps target
         }
     });
 
@@ -196,10 +306,9 @@ fn main() -> Result<(), slint::PlatformError> {
 
     let ui_weak_cancel = ui_handle.clone();
     ui.on_cancel_operation(move || {
-        // Implement cancellation logic if needed
-        let _ = ui_weak_cancel.upgrade_in_event_loop(|ui| {
+        if let Some(ui) = ui_weak_cancel.upgrade() {
             ui.set_status_msg("Cancellation requested (not fully implemented).".into());
-        });
+        }
     });
 
     let ui_weak_toggle = ui_handle.clone();
@@ -224,7 +333,7 @@ fn main() -> Result<(), slint::PlatformError> {
         let logger = logger_scan.clone();
         let folders_state = found_folders_scan.clone();
 
-        let ui = ui_weak.unwrap();
+        let ui = ui_weak.upgrade().unwrap();
         let folder_path = ui.get_selected_folder().to_string();
         let ignore_files = ui.get_ignore_files_text().to_string();
         let ignore_dirs = ui.get_ignore_list_text().to_string();
@@ -236,7 +345,7 @@ fn main() -> Result<(), slint::PlatformError> {
 
         ui.set_is_scanning(true);
         ui.set_status_msg("Scanning...".into());
-        ui.set_progress(0.0);
+        ui.set_progress(0.0); // Will become "indeterminate/looping" in Slint due to is_scanning
 
         if folder_path.is_empty() {
             logger.log("Please select a folder first.");
@@ -280,9 +389,11 @@ fn main() -> Result<(), slint::PlatformError> {
                         empty_count, count
                     ));
 
-                    *folders_state.lock().unwrap() = empty_dirs;
-
-                    let folders_clone = folders_state.lock().unwrap().clone();
+                    let folders_clone = {
+                        let mut state = folders_state.lock().unwrap();
+                        *state = empty_dirs;
+                        state.clone()
+                    };
 
                     let _ = ui_weak_thread.upgrade_in_event_loop(move |ui| {
                         let list_items = rebuild_visible_items(&folders_clone);
@@ -296,7 +407,7 @@ fn main() -> Result<(), slint::PlatformError> {
                             "Found {} empty directories.",
                             empty_count
                         )));
-                        ui.set_progress(1.0);
+                        ui.set_progress(1.0); // Max out progress indicator upon completion
                     });
                 }
                 Err(e) => {
@@ -318,14 +429,16 @@ fn main() -> Result<(), slint::PlatformError> {
         let logger = logger_del.clone();
         let folders_state = found_folders_del.clone();
 
-        let ui = ui_weak.unwrap();
+        let ui = ui_weak.upgrade().unwrap();
         let move_to_trash = ui.get_delete_mode() == 0;
         let ignore_errors = ui.get_ignore_errors();
         let pause_ms = ui.get_pause_ms();
         let ignore_files = ui.get_ignore_files_text().to_string();
+        let consider_empty_files_empty = ui.get_consider_empty_files_empty();
 
         ui.set_is_deleting(true);
         ui.set_status_msg("Deleting...".into());
+        ui.set_progress(0.0); // Reset progress for deletion phase
 
         let ui_weak_thread = ui.as_weak();
         thread::spawn(move || {
@@ -350,13 +463,18 @@ fn main() -> Result<(), slint::PlatformError> {
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
                     .collect(),
+                consider_empty_files_empty,
             };
 
             logger.log("[*] Starting deletion process...");
-            let (deleted, failed) =
-                scanner::delete_empty_dirs(&mut dirs, &settings, &|msg, idx, stat| {
-                    logger.status(msg, idx, stat)
-                });
+
+            let (deleted, failed) = scanner::delete_empty_dirs(
+                &mut dirs,
+                &settings,
+                &|msg, idx, stat| logger.status(msg, idx, stat),
+                &|p| logger.progress(p), // Forward live progress float
+            );
+
             logger.log(&format!(
                 "[+] Deletion finished. Deleted: {}, Failed: {}",
                 deleted, failed
@@ -369,6 +487,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 ui.set_failed_count(failed as i32);
                 ui.set_is_deleting(false);
                 ui.set_status_msg("Deletion complete.".into());
+                ui.set_progress(1.0); // Force 100% just in case
             });
         });
     });

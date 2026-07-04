@@ -145,7 +145,7 @@ export component AppWindow inherits Window {
             border-width: 1px;
             vertical-stretch: 1;
 
-            // Find
+            // Find Tab
             if root.active_tab == 0 : VerticalLayout {
                 padding: 15px;
                 spacing: 10px;
@@ -184,7 +184,7 @@ export component AppWindow inherits Window {
 
                                     for line in item.tree_lines: Rectangle {
                                         width: 20px;
-                                        height: 25px; // full height of the row
+                                        height: 25px;
 
                                         // Vertical line segment (for line == 1, 2, or 3)
                                         if line == 1 || line == 2 : Rectangle {
@@ -222,7 +222,8 @@ export component AppWindow inherits Window {
                                         }
                                         TouchArea {
                                             clicked => {
-                                                if (item.has_children) {
+                                                // Prevent race conditions during directory sweeps
+                                                if (item.has_children && !root.is_scanning && !root.is_deleting) {
                                                     root.toggle_expand(item.id);
                                                 }
                                             }
@@ -303,6 +304,7 @@ export component AppWindow inherits Window {
                     height: 20px;
                     ProgressIndicator {
                         progress: root.progress;
+                        indeterminate: root.is_scanning; // Runs standard sweeping animation during scanners
                         width: 200px;
                     }
                     Text {

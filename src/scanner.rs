@@ -67,9 +67,7 @@ pub fn scan_empty_dirs<F: Fn(&str)>(
 
     let entries: Vec<ignore::DirEntry> = rx.into_iter().collect();
 
-    use rayon::prelude::*;
-
-    // Compute metadata-heavy properties in parallel
+    // Parallel metadata gathering
     let mut entry_states: Vec<_> = entries
         .into_par_iter()
         .map(|entry| {
@@ -111,7 +109,7 @@ pub fn scan_empty_dirs<F: Fn(&str)>(
         })
         .collect();
 
-    // Sort by depth descending (bottom-up processing)
+    // Sort bottom-up for correct analysis of cascading emptiness
     entry_states.sort_by_key(|(_, d, _, _, _, _, _)| std::cmp::Reverse(*d));
 
     let mut dir_status: std::collections::HashMap<PathBuf, bool> = std::collections::HashMap::new();
@@ -130,7 +128,6 @@ pub fn scan_empty_dirs<F: Fn(&str)>(
             let dir_name = &child_name;
             let full_path_lower = p.to_string_lossy().replace('\\', "/").to_lowercase();
 
-            // It might already be marked as not empty from its children
             let mut is_empty = *dir_status.get(&p).unwrap_or(&true);
 
             if is_empty
@@ -148,10 +145,12 @@ pub fn scan_empty_dirs<F: Fn(&str)>(
                 empty_dirs_found.insert(p.clone());
                 included_dirs.insert(p.clone());
 
-                // Add parents up to root to form a tree
+                // Optimization: stop parent traversal early if it was already added to the set
                 let mut parent = p.parent();
                 while let Some(par) = parent {
-                    included_dirs.insert(par.to_path_buf());
+                    if !included_dirs.insert(par.to_path_buf()) {
+                        break;
+                    }
                     if par == root {
                         break;
                     }
@@ -198,6 +197,7 @@ pub fn scan_empty_dirs<F: Fn(&str)>(
         });
     }
 
+    // Determine tree relationships
     for i in 0..result.len() {
         if i + 1 < result.len() && result[i + 1].depth > result[i].depth {
             result[i].has_children = true;
@@ -225,21 +225,76 @@ pub struct DeleteSettings {
     pub ignore_errors: bool,
     pub pause_ms: u32,
     pub ignore_files: Vec<String>,
+    pub consider_empty_files_empty: bool,
 }
 
-pub fn delete_empty_dirs<F: Fn(&str, usize, i32)>(
+// Helper function to safely clean up directories and protect against symbolic link pitfalls
+fn clean_and_verify_empty(
+    dir: &Path,
+    settings: &DeleteSettings,
+    file_matchers: &[WildMatch],
+) -> Result<bool, String> {
+    // 1. Check if the directory itself is a symlink/junction
+    let meta = fs::symlink_metadata(dir).map_err(|e| e.to_string())?;
+    if meta.is_symlink() {
+        // If it's a symlink, treat it as an "empty" element so we safely delete the link, not its contents
+        return Ok(true);
+    }
+
+    if let Ok(entries) = fs::read_dir(dir) {
+        for child in entries.flatten() {
+            let cp = child.path();
+            let meta = fs::symlink_metadata(&cp);
+            let is_symlink = meta.as_ref().map(|m| m.is_symlink()).unwrap_or(false);
+
+            if is_symlink || cp.is_file() {
+                let child_name = cp.file_name().unwrap_or_default().to_string_lossy();
+                let is_ignored = file_matchers.iter().any(|m| m.matches(&child_name));
+                let is_empty_file = !is_symlink
+                    && settings.consider_empty_files_empty
+                    && fs::metadata(&cp).map(|m| m.len() == 0).unwrap_or(false);
+
+                if is_ignored || is_empty_file {
+                    // Symlinks inside the dir are safely deleted without traversing them
+                    let _ = fs::remove_file(&cp).or_else(|_| fs::remove_dir(&cp));
+                }
+            }
+        }
+    }
+
+    match fs::read_dir(dir) {
+        Ok(mut entries) => {
+            if entries.next().is_none() {
+                Ok(true)
+            } else {
+                Err("Directory is not empty (contains non-ignored files)".to_string())
+            }
+        }
+        Err(e) => Err(format!("Failed to verify directory: {}", e)),
+    }
+}
+
+pub fn delete_empty_dirs<F, P>(
     nodes: &mut [DirectoryNode],
     settings: &DeleteSettings,
     log: &F,
-) -> (usize, usize) {
+    progress_cb: &P,
+) -> (usize, usize)
+where
+    F: Fn(&str, usize, i32),
+    P: Fn(f32),
+{
     let mut deleted = 0;
     let mut failed = 0;
+    let mut processed_items = 0;
 
-    // Group indices by depth
     let mut depths: BTreeMap<i32, Vec<usize>> = BTreeMap::new();
+    let mut total_items = 0;
+
     for (i, node) in nodes.iter().enumerate() {
         if node.status == 1 {
             depths.entry(node.depth).or_default().push(i);
+            total_items += 1; // Count total files for progress calculation
         }
     }
 
@@ -251,50 +306,71 @@ pub fn delete_empty_dirs<F: Fn(&str, usize, i32)>(
 
     for (_depth, indices) in depths.into_iter().rev() {
         if settings.pause_ms == 0 {
-            // Fast path: parallel deletion for independent directories at the same depth
-            let results: Vec<_> = indices
-                .par_iter()
-                .map(|&i| {
-                    let dir = &nodes[i].path;
+            // Fast parallel path
+            let results: Vec<_> = {
+                // Borrow immutably in a restricted scope to satisfy Sync bounds
+                let nodes_ref: &[DirectoryNode] = nodes;
+                indices
+                    .par_iter()
+                    .map(|&i| {
+                        let dir = &nodes_ref[i].path;
 
-                    // Pre-delete ignored files
-                    if !file_matchers.is_empty()
-                        && let Ok(entries) = fs::read_dir(dir)
-                    {
-                        for child in entries.flatten() {
-                            let cp = child.path();
-                            if cp.is_file() {
-                                let child_name =
-                                    cp.file_name().unwrap_or_default().to_string_lossy();
-                                if file_matchers.iter().any(|m| m.matches(&child_name)) {
-                                    let _ = fs::remove_file(&cp);
+                        match clean_and_verify_empty(dir, settings, &file_matchers) {
+                            Ok(true) => {
+                                let meta = fs::symlink_metadata(dir);
+                                let is_symlink = meta.map(|m| m.is_symlink()).unwrap_or(false);
+
+                                let res = if settings.move_to_trash && !is_symlink {
+                                    trash::delete(dir).map_err(|e| e.to_string())
+                                } else {
+                                    // If it's a symlink, aggressively use fs::remove_dir/file to avoid trashing its real contents
+                                    if is_symlink {
+                                        fs::remove_dir(dir)
+                                            .or_else(|_| fs::remove_file(dir))
+                                            .map_err(|e| e.to_string())
+                                    } else {
+                                        fs::remove_dir(dir).map_err(|e| e.to_string())
+                                    }
+                                };
+
+                                match res {
+                                    Ok(_) => (i, 2, format!("Deleted: {}", dir.display()), None),
+                                    Err(e) => (
+                                        i,
+                                        4,
+                                        format!("Failed to delete {}: {}", dir.display(), e),
+                                        Some(e),
+                                    ),
                                 }
                             }
+                            Ok(false) => (
+                                i,
+                                4,
+                                format!(
+                                    "Failed to delete {}: Directory is not empty",
+                                    dir.display()
+                                ),
+                                None,
+                            ),
+                            Err(e) => (
+                                i,
+                                4,
+                                format!("Failed to delete {}: {}", dir.display(), e),
+                                None,
+                            ),
                         }
-                    }
-
-                    let res = if settings.move_to_trash {
-                        trash::delete(dir).map_err(|e| e.to_string())
-                    } else {
-                        fs::remove_dir(dir).map_err(|e| e.to_string())
-                    };
-
-                    match res {
-                        Ok(_) => (i, 2, format!("Deleted: {}", dir.display()), None),
-                        Err(e) => (
-                            i,
-                            4,
-                            format!("Failed to delete {}: {}", dir.display(), e),
-                            Some(e),
-                        ),
-                    }
-                })
-                .collect();
+                    })
+                    .collect()
+            }; // Immutable borrow of 'nodes' drops here
 
             let mut abort = false;
             for (i, status, msg, _err) in results {
+                processed_items += 1;
+                progress_cb(processed_items as f32 / total_items as f32);
+
                 log(&msg, i, status);
-                nodes[i].status = status;
+                nodes[i].status = status; // Safe to mutate sequentially now
+
                 if status == 2 {
                     deleted += 1;
                 } else {
@@ -310,40 +386,55 @@ pub fn delete_empty_dirs<F: Fn(&str, usize, i32)>(
                 break;
             }
         } else {
-            // Slow path: sequential deletion with pause
+            // Slow sequential path with pause
             let mut abort = false;
             for &i in &indices {
-                let dir = &nodes[i].path;
+                let dir = nodes[i].path.clone(); // Clone path to detach lifetime from 'nodes'
 
-                // Pre-delete ignored files
-                if !file_matchers.is_empty()
-                    && let Ok(entries) = fs::read_dir(dir)
-                {
-                    for child in entries.flatten() {
-                        let cp = child.path();
-                        if cp.is_file() {
-                            let child_name = cp.file_name().unwrap_or_default().to_string_lossy();
-                            if file_matchers.iter().any(|m| m.matches(&child_name)) {
-                                let _ = fs::remove_file(&cp);
+                match clean_and_verify_empty(&dir, settings, &file_matchers) {
+                    Ok(true) => {
+                        let meta = fs::symlink_metadata(&dir);
+                        let is_symlink = meta.map(|m| m.is_symlink()).unwrap_or(false);
+
+                        let res = if settings.move_to_trash && !is_symlink {
+                            trash::delete(&dir).map_err(|e| e.to_string())
+                        } else {
+                            if is_symlink {
+                                fs::remove_dir(&dir)
+                                    .or_else(|_| fs::remove_file(&dir))
+                                    .map_err(|e| e.to_string())
+                            } else {
+                                fs::remove_dir(&dir).map_err(|e| e.to_string())
+                            }
+                        };
+
+                        match res {
+                            Ok(_) => {
+                                log(&format!("Deleted: {}", dir.display()), i, 2);
+                                nodes[i].status = 2; // Mutate status safely
+                                deleted += 1;
+                            }
+                            Err(e) => {
+                                log(&format!("Failed to delete {}: {}", dir.display(), e), i, 4);
+                                nodes[i].status = 4;
+                                failed += 1;
+                                if !settings.ignore_errors {
+                                    log("Aborting deletion due to error.", i, 4);
+                                    abort = true;
+                                    break;
+                                }
                             }
                         }
                     }
-                }
-
-                let res = if settings.move_to_trash {
-                    trash::delete(dir).map_err(|e| e.to_string())
-                } else {
-                    fs::remove_dir(dir).map_err(|e| e.to_string())
-                };
-
-                match res {
-                    Ok(_) => {
-                        log(&format!("Deleted: {}", dir.display()), i, 2);
-                        nodes[i].status = 2;
-                        deleted += 1;
-                    }
-                    Err(e) => {
-                        log(&format!("Failed to delete {}: {}", dir.display(), e), i, 4);
+                    _ => {
+                        log(
+                            &format!(
+                                "Failed to delete {}: Not empty or inaccessible",
+                                dir.display()
+                            ),
+                            i,
+                            4,
+                        );
                         nodes[i].status = 4;
                         failed += 1;
                         if !settings.ignore_errors {
@@ -353,6 +444,9 @@ pub fn delete_empty_dirs<F: Fn(&str, usize, i32)>(
                         }
                     }
                 }
+
+                processed_items += 1;
+                progress_cb(processed_items as f32 / total_items as f32);
 
                 if settings.pause_ms > 0 {
                     std::thread::sleep(std::time::Duration::from_millis(settings.pause_ms as u64));
