@@ -53,7 +53,7 @@ component ProtectedIcon {
         // Lock shackle
         Rectangle {
             x: 2px;
-            y: -5px;
+            y: 5px;
             width: 6px;
             height: 6px;
             border-color: #55A0FF;
@@ -414,7 +414,7 @@ export component AppWindow inherits Window {
                             HorizontalLayout { spacing: 8px; height: 18px; Rectangle { width: 16px; height: 16px; ProtectedIcon {} } Text { text: "Protected"; color: #55A0FF; vertical-alignment: center; } }
                             HorizontalLayout { spacing: 8px; height: 18px; Rectangle { width: 16px; height: 16px; DeletedIcon {} } Text { text: "Deleted"; color: #55FF55; vertical-alignment: center; } }
 
-                            Rectangle { height: 10px; } // Separator
+                            Rectangle {} // Flexible Spacer: absorbs all extra vertical space to prevent drifting [1]
 
                             HorizontalLayout { spacing: 8px; height: 16px; Rectangle { width: 12px; height: 12px; background: #D4D4D4; border-radius: 2px; y: 2px; } Text { text: "Will not be touched"; vertical-alignment: center; color: #D4D4D4; font-size: 11px; } }
                             HorizontalLayout { spacing: 8px; height: 16px; Rectangle { width: 12px; height: 12px; background: #FF5555; border-radius: 2px; y: 2px; } Text { text: "Will be deleted"; vertical-alignment: center; color: #D4D4D4; font-size: 11px; } }
