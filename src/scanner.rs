@@ -17,8 +17,8 @@ pub struct ScanSettings {
     pub min_age_hours: u32,
     pub max_depth: i32,
     pub consider_empty_files_empty: bool,
-    /// If true, access-error details (e.g. "access denied") are collapsed into
-    /// a single summary line instead of being logged individually.
+    /// If true, access-error details (e.g., "permission denied") are collapsed
+    /// into a single summary line instead of being logged individually.
     pub hide_search_errors: bool,
 }
 
@@ -27,14 +27,14 @@ pub struct DirectoryNode {
     pub path: Arc<Path>,
     pub name: String,
     pub depth: i32,
-    pub status: i32,
+    pub status: i32, // 0: Normal, 1: Empty, 2: Deleted, 3: Protected, 4: Failed
     pub has_children: bool,
     pub is_expanded: bool,
     pub is_last_sibling: bool,
 }
 
 /// Messages coming out of the parallel filesystem walk: either a successfully
-/// read entry, or an error (e.g. permission denied) that we still want to
+/// read entry, or an error (e.g., permission denied) that we still want to
 /// surface to the user instead of silently dropping.
 enum WalkMsg {
     Entry(ignore::DirEntry),
@@ -73,10 +73,10 @@ fn is_system_dir(_path: &Path) -> bool {
     false
 }
 
-pub fn scan_empty_dirs<F: Fn(&str)>(
+pub fn scan_empty_dirs(
     root: &Path,
     settings: &ScanSettings,
-    log: &F,
+    log: &dyn Fn(&str),
     cancel_flag: &Arc<AtomicBool>,
 ) -> Result<Vec<DirectoryNode>, String> {
     let file_matchers: Vec<WildMatch> = settings
@@ -140,7 +140,7 @@ pub fn scan_empty_dirs<F: Fn(&str)>(
     if !walk_errors.is_empty() {
         if settings.hide_search_errors {
             log(&format!(
-                "[!] {} item(s) skipped due to access errors (enable \"Hide search errors\" off to see details).",
+                "[!] {} item(s) skipped due to access errors.",
                 walk_errors.len()
             ));
         } else {
@@ -270,6 +270,9 @@ pub fn scan_empty_dirs<F: Fn(&str)>(
             && !file_matchers.iter().any(|m| m.matches(&child_name))
             && let Some(parent) = p.parent()
         {
+            // Symlinks (and any other special entry type) fall through both
+            // is_dir and is_file when the walker doesn't follow links. Treating
+            // them as real content keeps scan-time and delete-time behavior consistent.
             dir_status.insert(Arc::from(parent), false);
         }
     }
@@ -336,6 +339,7 @@ pub struct DeleteSettings {
     pub pause_ms: u32,
     pub ignore_files: Vec<String>,
     pub consider_empty_files_empty: bool,
+    pub dry_run: bool,
 }
 
 // Helper function to safely clean up directories and protect against symbolic link pitfalls
@@ -364,7 +368,7 @@ fn clean_and_verify_empty(
                     && settings.consider_empty_files_empty
                     && fs::metadata(&cp).map(|m| m.len() == 0).unwrap_or(false);
 
-                if is_ignored || is_empty_file {
+                if (is_ignored || is_empty_file) && !settings.dry_run {
                     // Symlinks are safely deleted via remove_file/remove_dir without traversing
                     let _ = fs::remove_file(&cp).or_else(|_| fs::remove_dir(&cp));
                 }
@@ -432,6 +436,15 @@ where
                             return (i, 4, "Cancelled".to_string(), None);
                         }
                         let dir = &nodes_ref[i].path;
+
+                        if settings.dry_run {
+                            return (
+                                i,
+                                2,
+                                format!("[Dry-Run] Would delete: {}", dir.display()),
+                                None,
+                            );
+                        }
 
                         match clean_and_verify_empty(dir, settings, &file_matchers) {
                             Ok(true) => {
@@ -520,6 +533,15 @@ where
                 }
 
                 let dir = nodes[i].path.clone();
+
+                if settings.dry_run {
+                    log(&format!("[Dry-Run] Would delete: {}", dir.display()), i, 2);
+                    nodes[i].status = 2;
+                    deleted += 1;
+                    processed_items += 1;
+                    progress_cb(processed_items as f32 / total_items as f32);
+                    continue;
+                }
 
                 match clean_and_verify_empty(&dir, settings, &file_matchers) {
                     Ok(true) => {

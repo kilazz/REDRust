@@ -243,6 +243,7 @@ export component AppWindow inherits Window {
     }
 
     title: "Remove Empty Directories";
+    icon: @image-url("../assets/icon.png");
     min-width: 850px;
     min-height: 650px;
     background: #1e1e1e;
@@ -278,12 +279,20 @@ export component AppWindow inherits Window {
     in-out property <int> pause_ms: 0;
     in-out property <string> ignore_files_text: "desktop.ini\nThumbs.db\n.DS_Store";
 
+    // Added settings features
+    in-out property <bool> is_integrated: false;
+    in-out property <bool> auto_save_logs: false;
+
     callback browse_folder() -> string;
     callback search_folders();
     callback delete_folders();
     callback cancel_operation();
     callback exit_app();
     callback toggle_expand(int);
+
+    // Context Menu & Logger callbacks
+    callback toggle_context_menu(bool);
+    callback toggle_auto_save_logs(bool);
 
     VerticalLayout {
         padding: 10px;
@@ -496,6 +505,20 @@ export component AppWindow inherits Window {
                     CheckBox { text: "Ignore errors during deletion"; checked <=> root.ignore_errors; }
                     CheckBox { text: "Hide search errors (like access denied errors)"; checked <=> root.hide_search_errors; }
                     CheckBox { text: "Skip system directories (recommended)"; checked <=> root.skip_system; }
+
+                    Rectangle { height: 1px; background: #3e3e42; vertical-stretch: 0; }
+
+                    Text { text: "OS Integration & Logs"; font-weight: 700; }
+                    CheckBox {
+                        text: "Integrate into Windows Explorer Context Menu";
+                        checked <=> root.is_integrated;
+                        toggled => { root.toggle_context_menu(root.is_integrated); }
+                    }
+                    CheckBox {
+                        text: "Auto-save logs to file (%APPDATA%/RED/logs/)";
+                        checked <=> root.auto_save_logs;
+                        toggled => { root.toggle_auto_save_logs(root.auto_save_logs); }
+                    }
 
                     Rectangle { height: 1px; background: #3e3e42; vertical-stretch: 0; }
 

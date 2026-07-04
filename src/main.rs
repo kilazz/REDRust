@@ -9,13 +9,17 @@ slint::include_modules!();
 mod scanner;
 
 use clap::Parser;
+use serde::Serialize;
 use slint::{ModelRc, SharedString, VecModel};
 use std::collections::VecDeque;
+use std::fs;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
+
+static AUTO_SAVE_LOGS: AtomicBool = AtomicBool::new(false);
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -31,6 +35,14 @@ struct Cli {
     /// Automatically delete empty directories found during the scan.
     #[arg(short, long)]
     delete: bool,
+
+    /// Simulate deletion without modifying any files (Dry-Run).
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Format CLI output as structured JSON.
+    #[arg(long)]
+    json: bool,
 
     // Configurable parameters for scripts and automation
     #[arg(long, default_value_t = -1)]
@@ -66,6 +78,26 @@ struct Cli {
     hide_search_errors: bool,
 }
 
+#[derive(Serialize)]
+struct JsonReport {
+    scan_path: String,
+    empty_directories_found: Vec<JsonDir>,
+    deletion_summary: Option<JsonDeletionSummary>,
+}
+
+#[derive(Serialize)]
+struct JsonDir {
+    path: String,
+    status: &'static str,
+}
+
+#[derive(Serialize)]
+struct JsonDeletionSummary {
+    deleted: usize,
+    failed: usize,
+    dry_run: bool,
+}
+
 pub enum LogEvent {
     Msg(String),
     StatusChange(usize, i32), // index, status
@@ -79,6 +111,9 @@ pub struct UiLogger {
 
 impl UiLogger {
     pub fn log(&self, msg: &str) {
+        if AUTO_SAVE_LOGS.load(Ordering::Relaxed) {
+            write_to_file_log(msg);
+        }
         if let Some(sender) = &self.sender {
             let _ = sender.send(LogEvent::Msg(format!("{}\n", msg)));
         } else {
@@ -87,6 +122,9 @@ impl UiLogger {
     }
 
     pub fn status(&self, msg: &str, index: usize, status: i32) {
+        if AUTO_SAVE_LOGS.load(Ordering::Relaxed) {
+            write_to_file_log(msg);
+        }
         if let Some(sender) = &self.sender {
             let _ = sender.send(LogEvent::Msg(format!("{}\n", msg)));
             let _ = sender.send(LogEvent::StatusChange(index, status));
@@ -102,13 +140,87 @@ impl UiLogger {
     }
 }
 
+fn write_to_file_log(msg: &str) {
+    if let Some(proj_dirs) = std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+    {
+        let log_dir = proj_dirs.join("RED").join("logs");
+        if fs::create_dir_all(&log_dir).is_ok() {
+            let log_file = log_dir.join("red.log");
+            if let Ok(mut file) = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log_file)
+            {
+                use std::io::Write;
+                let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+                let _ = writeln!(file, "[{}] {}", timestamp, msg.trim_end());
+            }
+        }
+    }
+}
+
+// Windows Explorer Registry helpers (written to HKCU - no Administrator UAC required)
+#[cfg(target_os = "windows")]
+fn check_registry_integration() -> bool {
+    use winreg::RegKey;
+    use winreg::enums::{HKEY_CURRENT_USER, KEY_READ};
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    hkcu.open_subkey_with_flags(
+        r"Software\Classes\Directory\shell\RemoveEmptyDirs\command",
+        KEY_READ,
+    )
+    .is_ok()
+}
+
+#[cfg(target_os = "windows")]
+fn set_registry_integration(integrate: bool) -> Result<(), String> {
+    use winreg::RegKey;
+    use winreg::enums::{HKEY_CURRENT_USER, KEY_WRITE};
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let path = r"Software\Classes\Directory\shell\RemoveEmptyDirs";
+
+    if integrate {
+        let current_exe = std::env::current_exe()
+            .map_err(|e| format!("Failed to resolve current executable path: {}", e))?;
+        let command_str = format!("\"{}\" \"%1\"", current_exe.to_string_lossy());
+
+        let (key, _) = hkcu
+            .create_subkey_with_flags(path, KEY_WRITE)
+            .map_err(|e| e.to_string())?;
+        key.set_value("", &"Remove empty folders here")
+            .map_err(|e| e.to_string())?;
+
+        // This adds the Coffee Cup icon next to the context menu text in Windows Explorer [3]:
+        key.set_value("Icon", &current_exe.to_string_lossy().as_ref())
+            .map_err(|e| e.to_string())?;
+
+        let (cmd_key, _) = key
+            .create_subkey_with_flags("command", KEY_WRITE)
+            .map_err(|e| e.to_string())?;
+        cmd_key
+            .set_value("", &command_str)
+            .map_err(|e| e.to_string())?;
+    } else {
+        let _ = hkcu.delete_subkey_all(path);
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn check_registry_integration() -> bool {
+    false
+}
+
+#[cfg(not(target_os = "windows"))]
+fn set_registry_integration(_integrate: bool) -> Result<(), String> {
+    Ok(())
+}
+
 fn rebuild_visible_items(folders: &[scanner::DirectoryNode]) -> Vec<DirectoryItem> {
     let mut result = Vec::new();
     let mut hide_depth = i32::MAX;
-
-    // Grows on demand instead of the old fixed `[false; 256]` buffer, which
-    // silently mis-rendered the tree lines for anything nested deeper than
-    // 256 levels (e.g., some node_modules-style trees).
     let mut active_depths: Vec<bool> = Vec::new();
 
     for (i, node) in folders.iter().enumerate() {
@@ -127,16 +239,16 @@ fn rebuild_visible_items(folders: &[scanner::DirectoryNode]) -> Vec<DirectoryIte
             for d in 0..(node.depth - 1) {
                 let d = d as usize;
                 if d < active_depths.len() && active_depths[d] {
-                    tree_lines_vec.push(1); // vertical
+                    tree_lines_vec.push(1);
                 } else {
-                    tree_lines_vec.push(0); // empty
+                    tree_lines_vec.push(0);
                 }
             }
             if node.depth > 0 {
                 if node.is_last_sibling {
-                    tree_lines_vec.push(3); // L-junction
+                    tree_lines_vec.push(3);
                 } else {
-                    tree_lines_vec.push(2); // T-junction
+                    tree_lines_vec.push(2);
                 }
             }
 
@@ -164,23 +276,19 @@ fn rebuild_visible_items(folders: &[scanner::DirectoryNode]) -> Vec<DirectoryIte
 }
 
 fn main() -> Result<(), slint::PlatformError> {
-    // Attempt to attach to the parent terminal console (PowerShell/CMD) if the app
-    // was launched via CLI. This allows a GUI app to print stdout/stderr.
     #[cfg(target_os = "windows")]
     unsafe {
         use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
-        // Result is ignored: if launched via double-click from Explorer, it fails silently
-        // and the app just runs as a normal GUI.
         let _ = AttachConsole(ATTACH_PARENT_PROCESS);
     }
 
     let cli = Cli::parse();
 
-    // Full console mode (CLI) without launching the graphical user interface
-    if cli.quiet || cli.delete {
+    // Full CLI Mode
+    if cli.quiet || cli.delete || cli.json {
         let dummy_cancel = Arc::new(AtomicBool::new(false));
         if let Some(path_str) = cli.path {
-            let path = PathBuf::from(path_str);
+            let path = PathBuf::from(path_str.clone());
             let scan_settings = scanner::ScanSettings {
                 ignore_files: cli
                     .ignore_files
@@ -202,14 +310,17 @@ fn main() -> Result<(), slint::PlatformError> {
                 hide_search_errors: cli.hide_search_errors,
             };
 
-            if !cli.quiet {
+            if !cli.quiet && !cli.json {
                 println!("[*] Scanning: {:?}", path);
             }
+
+            let mut json_dirs = Vec::new();
+
             match scanner::scan_empty_dirs(
                 &path,
                 &scan_settings,
                 &|msg| {
-                    if !cli.quiet {
+                    if !cli.quiet && !cli.json {
                         println!("{}", msg);
                     }
                 },
@@ -217,12 +328,33 @@ fn main() -> Result<(), slint::PlatformError> {
             ) {
                 Ok(mut dirs) => {
                     let empty_count = dirs.iter().filter(|d| d.status == 1).count();
-                    if !cli.quiet {
+                    if !cli.quiet && !cli.json {
                         println!("[+] Found {} empty directories.", empty_count);
                     }
+
+                    if cli.json {
+                        for d in &dirs {
+                            let status_str = match d.status {
+                                1 => "empty",
+                                3 => "protected",
+                                _ => "normal",
+                            };
+                            json_dirs.push(JsonDir {
+                                path: d.path.to_string_lossy().into_owned(),
+                                status: status_str,
+                            });
+                        }
+                    }
+
+                    let mut deletion_summary = None;
+
                     if cli.delete && empty_count > 0 {
-                        if !cli.quiet {
-                            println!("[*] Deleting...");
+                        if !cli.quiet && !cli.json {
+                            if cli.dry_run {
+                                println!("[*] Simulating deletion (Dry-Run)...");
+                            } else {
+                                println!("[*] Deleting...");
+                            }
                         }
                         let delete_settings = scanner::DeleteSettings {
                             move_to_trash: !cli.delete_permanently,
@@ -230,33 +362,67 @@ fn main() -> Result<(), slint::PlatformError> {
                             pause_ms: 0,
                             ignore_files: scan_settings.ignore_files.clone(),
                             consider_empty_files_empty: cli.consider_empty_files_empty,
+                            dry_run: cli.dry_run,
                         };
                         let (deleted, failed) = scanner::delete_empty_dirs(
                             &mut dirs,
                             &delete_settings,
                             &|msg, _, _| {
-                                if !cli.quiet {
+                                if !cli.quiet && !cli.json {
                                     println!("{}", msg);
                                 }
                             },
                             &|_| {},
                             &dummy_cancel,
                         );
-                        if !cli.quiet {
-                            println!("[+] Finished. Deleted: {}, Failed: {}", deleted, failed);
+                        if !cli.quiet && !cli.json {
+                            if cli.dry_run {
+                                println!(
+                                    "[+] Simulation complete. Would delete: {}, Failed: {}",
+                                    deleted, failed
+                                );
+                            } else {
+                                println!(
+                                    "[+] Deletion complete. Deleted: {}, Failed: {}",
+                                    deleted, failed
+                                );
+                            }
+                        }
+
+                        if cli.json {
+                            deletion_summary = Some(JsonDeletionSummary {
+                                deleted,
+                                failed,
+                                dry_run: cli.dry_run,
+                            });
+                        }
+                    }
+
+                    if cli.json {
+                        let report = JsonReport {
+                            scan_path: path_str,
+                            empty_directories_found: json_dirs,
+                            deletion_summary,
+                        };
+                        if let Ok(json_str) = serde_json::to_string_pretty(&report) {
+                            println!("{}", json_str);
                         }
                     }
                 }
                 Err(e) => {
-                    if !cli.quiet {
+                    if !cli.quiet && !cli.json {
                         eprintln!("[!] Error: {}", e);
+                    } else if cli.json {
+                        println!("{{\"error\": \"{}\"}}", e);
                     }
                     std::process::exit(1);
                 }
             }
         } else {
-            if !cli.quiet {
-                eprintln!("[!] Error: Path is required for CLI/Quiet mode.");
+            if !cli.quiet && !cli.json {
+                eprintln!("[!] Error: Path is required for CLI/Quiet/JSON mode.");
+            } else if cli.json {
+                println!("{{\"error\": \"Path is required\"}}");
             }
             std::process::exit(1);
         }
@@ -265,6 +431,10 @@ fn main() -> Result<(), slint::PlatformError> {
 
     let ui = AppWindow::new()?;
     let ui_handle = ui.as_weak();
+
+    // Initialize OS Context Menu and Log configuration states on startup
+    ui.set_is_integrated(check_registry_integration());
+    ui.set_auto_save_logs(AUTO_SAVE_LOGS.load(Ordering::Relaxed));
 
     if let Some(path) = cli.path {
         ui.set_selected_folder(SharedString::from(path));
@@ -308,7 +478,6 @@ fn main() -> Result<(), slint::PlatformError> {
 
             process_event(evt);
 
-            // Drain remaining events in the channel queue
             while let Ok(m) = log_rx.try_recv() {
                 process_event(m);
             }
@@ -328,14 +497,11 @@ fn main() -> Result<(), slint::PlatformError> {
                 folders.clone()
             };
 
-            // Throttle tree view model rebuilding
             let now = std::time::Instant::now();
             let elapsed_ms = now.duration_since(last_rebuild_time).as_millis();
 
             let is_finished = progress_update.map(|p| p >= 1.0).unwrap_or(false);
 
-            // Rebuild tree if status changed AND either 120ms passed, or we finished,
-            // or total size is small (< 150 items)
             let should_rebuild = pending_status_updates
                 && (elapsed_ms >= 120 || folders_clone.len() < 150 || is_finished);
 
@@ -365,7 +531,7 @@ fn main() -> Result<(), slint::PlatformError> {
                     ui.set_directories(new_model.into());
                 }
             });
-            thread::sleep(std::time::Duration::from_millis(16)); // ~60fps target
+            thread::sleep(std::time::Duration::from_millis(16));
         }
     });
 
@@ -402,6 +568,18 @@ fn main() -> Result<(), slint::PlatformError> {
             let new_model = Rc::new(VecModel::from(list_items));
             ui.set_directories(new_model.into());
         }
+    });
+
+    // Windows Context Menu Integration Callback
+    ui.on_toggle_context_menu(move |integrate| {
+        if let Err(e) = set_registry_integration(integrate) {
+            eprintln!("[!] Context menu integration failed: {}", e);
+        }
+    });
+
+    // Auto-save Logs Callback
+    ui.on_toggle_auto_save_logs(move |save| {
+        AUTO_SAVE_LOGS.store(save, Ordering::Relaxed);
     });
 
     let ui_weak_scan = ui_handle.clone();
@@ -569,6 +747,7 @@ fn main() -> Result<(), slint::PlatformError> {
                     .filter(|s| !s.is_empty())
                     .collect(),
                 consider_empty_files_empty,
+                dry_run: false, // UI deletes physically
             };
 
             logger.log("[*] Starting deletion process...");
